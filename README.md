@@ -1,6 +1,6 @@
 # Neuraframe — automatisation des événements
 
-[![tests](https://github.com/NeuraFrame-group/neuraframe-event-automation/actions/workflows/tests.yml/badge.svg)](https://github.com/NeuraFrame-group/neuraframe-event-automation/actions/workflows/tests.yml)
+[![tests](https://github.com/Nogueira-Kevin/neuraframe-event-automation/actions/workflows/tests.yml/badge.svg)](https://github.com/Nogueira-Kevin/neuraframe-event-automation/actions/workflows/tests.yml)
 
 Extrait du code de production de [Neuraframe](https://neuraframe.ch), une plateforme SaaS
 multi-tenant (PHP 8, MySQL) qui automatise les inscriptions, les e-mails et les groupes
