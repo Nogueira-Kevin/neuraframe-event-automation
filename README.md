@@ -2,17 +2,18 @@
 
 [![tests](https://github.com/Nogueira-Kevin/neuraframe-event-automation/actions/workflows/tests.yml/badge.svg)](https://github.com/Nogueira-Kevin/neuraframe-event-automation/actions/workflows/tests.yml)
 
-Extrait du code de production de [Neuraframe](https://neuraframe.ch), une plateforme SaaS
-multi-tenant (PHP 8, MySQL) qui automatise les inscriptions, les e-mails et les groupes
-WhatsApp de formateurs et d'organisateurs d'événements.
+> **En bref.** Préparer un événement prenait jusqu'à 3 jours à la main. J'ai automatisé
+> toute la préparation : elle se fait maintenant en quelques secondes, en production.
+> Ce dépôt en montre le cœur, un bug trouvé en revue de code et corrigé, et 16 tests.
 
-## Le problème
+| | |
+|---|---|
+| **Situation** | Formateurs et organisateurs utilisent [Neuraframe](https://neuraframe.ch), ma plateforme SaaS multi-tenant (PHP 8, MySQL). |
+| **Problème** | Pour chaque événement : créer le groupe WhatsApp (icône, description, admins), la liste e-mail, puis programmer chaque rappel (J-7, J-1, jour J…). Jusqu'à 3 jours de travail. |
+| **Ce que j'ai fait** | Une préparation automatique déclenchée à l'enregistrement, fiable même si elle est lancée deux fois, qui suit le scénario dessiné par l'utilisateur dans un éditeur visuel. |
+| **Résultat** | Quelques secondes au lieu de jours. Les rappels sont calculés à l'heure locale de l'événement, heure d'été comprise. |
 
-Préparer un événement prenait jusqu'à **3 jours de travail manuel** : créer le groupe
-WhatsApp, son icône, sa description, nommer les administrateurs, créer la liste d'e-mails,
-puis programmer à la main chaque rappel (J-7, J-1, jour J…) selon les dates de l'événement.
-
-## La solution
+## Comment ça marche
 
 Quand un événement est enregistré, un job `event.setup` est mis en file d'attente.
 Le worker appelle `EventSetup::run()`, qui fait tout en **quelques secondes** :
