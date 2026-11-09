@@ -1,5 +1,5 @@
 <?php
-// global-db/_inc/EventSetup.php
+// EventSetup.php
 // Orchestrateur d'initialisation d'un événement (appelé par le worker, type event.setup).
 //
 // Ordre d'exécution :
@@ -15,6 +15,8 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/senders/WppGroupSetup.php';
 require_once __DIR__ . '/senders/BrevoSetup.php';
+require_once __DIR__ . '/AutomationSchedule.php';
+require_once __DIR__ . '/Outbox.php';
 
 final class EventSetup
 {
@@ -266,28 +268,18 @@ final class EventSetup
         string $waGroupId,
         int    $brevoListId
     ): void {
-        // Supprimer les messages en attente pour cet événement (évite les doublons sur re-save).
-        // NB : on DELETE (et non SET status='cancelled') car l'enum outbox_messages.status
-        // ne contient pas 'cancelled' → un UPDATE stockerait '' (valeur invalide).
-        nfg_pdo_ops()
-            ->prepare("
-                DELETE FROM outbox_messages
-                WHERE tenant_id = ? AND type IN ('wa.event_message', 'email.campaign')
-                  AND JSON_EXTRACT(payload_json, '$.event_id') = ?
-                  AND status = 'pending'
-            ")
-            ->execute([$tenantId, $eventId]);
+        self::clearPendingMessages($tenantId, $eventId);
 
         // Automations event_created actives pour ce tenant+produit
-        $automations = self::findEventCreatedAutomations($tenantId, $productId);
+        $automations = self::findAutomationsByTrigger($tenantId, $productId, 'event_created');
         if (!$automations) {
             // Aucun scénario event_created → étape terminée (0 message) sinon spinner éternel.
             self::writeState($tenantId, $eventId, ['scheduling' => ['status' => 'ready', 'count' => 0]]);
             return;
         }
 
-        $tzSt = nfg_pdo_app()->prepare("SELECT tz FROM events WHERE id = ? LIMIT 1");
-        $tzSt->execute([$eventId]);
+        $tzSt = nfg_pdo_app()->prepare("SELECT tz FROM events WHERE id = ? AND tenant_id = ? LIMIT 1");
+        $tzSt->execute([$eventId, $tenantId]);
         $eventTz = (string)(($tzSt->fetch(\PDO::FETCH_ASSOC)['tz'] ?? '') ?: 'UTC');
 
         // Sessions de l'événement
@@ -305,8 +297,8 @@ final class EventSetup
         $scheduled = 0;
         foreach ($automations as $auto) {
             $graph   = json_decode($auto['graph'] ?? '{}', true) ?: [];
-            $trigger = self::findTrigger($graph);
-            $steps   = self::walkGraph($graph);
+            $trigger = AutomationSchedule::findTrigger($graph);
+            $steps   = AutomationSchedule::walkGraph($graph);
             if (!$steps) continue;
 
             $segMode    = $trigger['event_segment_mode'] ?? 'continuous';
@@ -317,72 +309,88 @@ final class EventSetup
                 : [$sessions[0]['start_at_utc']];
 
             foreach ($refDates as $refUtc) {
-                $refTs = strtotime($refUtc);
-
                 foreach ($steps as $step) {
-                    if ($step['type'] !== 'send') continue;
-
-                    $timing = $step['timing'] ?? ['mode' => 'relative', 'offset_seconds' => $step['offset_seconds'] ?? 0];
-                    if (($timing['mode'] ?? '') === 'fixed') {
-                        $availTs = self::fixedTimeTs($eventTz, $refUtc, (int)($timing['days'] ?? 0), (string)($timing['time'] ?? '09:00'));
-                    } else {
-                        $availTs = $refTs + (int)($timing['offset_seconds'] ?? 0);
-                    }
-                    $availableAt = date('Y-m-d H:i:s', $availTs);
-                    $idem        = substr(
-                        md5("ev{$eventId}_a{$auto['id']}_{$refUtc}_{$step['node_id']}"),
-                        0, 32
-                    );
-
-                    if ($step['channel'] === 'whatsapp') {
-                        if (!$waGroupId) continue;
-                        $body = (($step['message_mode'] ?? '') === 'direct' && trim((string)($step['body'] ?? '')) !== '')
-                            ? (string)$step['body']
-                            : self::templateBody($tenantId, (int)$step['template_id'], 'whatsapp');
-                        if (!$body) continue;
-
-                        Outbox::publish('wa.event_message', $tenantId, [
-                            'event_id' => $eventId,
-                            'group_id' => $waGroupId,
-                            'body'     => $body,
-                        ], $idem, null);
-
-                        nfg_pdo_ops()
-                            ->prepare("
-                                UPDATE outbox_messages SET available_at = ?
-                                WHERE idem_key = ? AND type = 'wa.event_message' AND status = 'pending'
-                            ")
-                            ->execute([$availableAt, $idem]);
-                        $scheduled++;
-
-                    } elseif ($step['channel'] === 'email') {
-                        $emailPayload = ['event_id' => $eventId];
-                        if (($step['message_mode'] ?? '') === 'direct'
-                            && ((string)($step['subject'] ?? '') !== '' || (string)($step['body'] ?? '') !== '')) {
-                            $emailPayload['message_mode'] = 'direct';
-                            $emailPayload['subject']      = (string)($step['subject'] ?? '');
-                            $emailPayload['body']         = (string)($step['body'] ?? '');
-                            if ((string)($step['from_email'] ?? '') !== '') $emailPayload['from_email'] = (string)$step['from_email'];
-                            if ((string)($step['from_name'] ?? '') !== '')  $emailPayload['from_name']  = (string)$step['from_name'];
-                        } else {
-                            if ((int)($step['template_id'] ?? 0) <= 0) continue;
-                            $emailPayload['template_id'] = (int)$step['template_id'];
-                        }
-                        Outbox::publish('email.campaign', $tenantId, $emailPayload, $idem, null);
-
-                        nfg_pdo_ops()
-                            ->prepare("
-                                UPDATE outbox_messages SET available_at = ?
-                                WHERE idem_key = ? AND type = 'email.campaign' AND status = 'pending'
-                            ")
-                            ->execute([$availableAt, $idem]);
-                        $scheduled++;
-                    }
+                    $idem = substr(md5("ev{$eventId}_a{$auto['id']}_{$refUtc}_{$step['node_id']}"), 0, 32);
+                    $at   = AutomationSchedule::sendAt($step['timing'], (string)$refUtc, $eventTz);
+                    if (self::enqueueSend($tenantId, $eventId, $step, $waGroupId, $at, $idem)) $scheduled++;
                 }
             }
         }
 
         self::writeState($tenantId, $eventId, ['scheduling' => ['status' => 'ready', 'count' => $scheduled]]);
+    }
+
+    /**
+     * Retire les messages encore en attente de cet événement, pour qu'un ré-enregistrement
+     * ne les planifie pas deux fois. Les messages déjà partis (status 'done') restent :
+     * leur clé d'idempotence empêche de les renvoyer.
+     * DELETE et non SET status='cancelled' : l'enum outbox_messages.status ne contient pas
+     * 'cancelled', un UPDATE stockerait '' (valeur invalide).
+     */
+    private static function clearPendingMessages(int $tenantId, int $eventId): void
+    {
+        nfg_pdo_ops()
+            ->prepare("
+                DELETE FROM outbox_messages
+                WHERE tenant_id = ? AND type IN ('wa.event_message', 'email.campaign')
+                  AND JSON_EXTRACT(payload_json, '$.event_id') = ?
+                  AND status = 'pending'
+            ")
+            ->execute([$tenantId, $eventId]);
+    }
+
+    /**
+     * Met en file un nœud « send » (WhatsApp de groupe ou e-mail) pour l'instant $availableAt.
+     * La date part DANS l'insertion : publier « tout de suite » puis reprogrammer laissait au
+     * worker une fenêtre pour envoyer immédiatement un rappel prévu à J-7.
+     * Renvoie false si l'étape n'a rien à envoyer (pas de groupe, modèle vide…).
+     */
+    private static function enqueueSend(
+        int    $tenantId,
+        int    $eventId,
+        array  $step,
+        string $waGroupId,
+        string $availableAt,
+        string $idem,
+        array  $vars = []
+    ): bool {
+        if (($step['type'] ?? '') !== 'send') return false;
+        $mode = (string)($step['message_mode'] ?? '');
+
+        if (($step['channel'] ?? '') === 'whatsapp') {
+            if ($waGroupId === '') return false;
+            $body = ($mode === 'direct' && trim((string)($step['body'] ?? '')) !== '')
+                ? (string)$step['body']
+                : self::templateBody($tenantId, (int)$step['template_id'], 'whatsapp');
+            $body = AutomationSchedule::renderVars($body, $vars);
+            if (trim($body) === '') return false;
+
+            Outbox::publish('wa.event_message', $tenantId, [
+                'event_id' => $eventId,
+                'group_id' => $waGroupId,
+                'body'     => $body,
+            ], $idem, $availableAt);
+            return true;
+        }
+
+        if (($step['channel'] ?? '') === 'email') {
+            $payload = ['event_id' => $eventId];
+            if ($mode === 'direct'
+                && ((string)($step['subject'] ?? '') !== '' || (string)($step['body'] ?? '') !== '')) {
+                $payload['message_mode'] = 'direct';
+                $payload['subject']      = AutomationSchedule::renderVars((string)($step['subject'] ?? ''), $vars);
+                $payload['body']         = AutomationSchedule::renderVars((string)($step['body'] ?? ''), $vars);
+                if ((string)($step['from_email'] ?? '') !== '') $payload['from_email'] = (string)$step['from_email'];
+                if ((string)($step['from_name'] ?? '') !== '')  $payload['from_name']  = (string)$step['from_name'];
+            } else {
+                if ((int)($step['template_id'] ?? 0) <= 0) return false;
+                $payload['template_id'] = (int)$step['template_id'];
+            }
+            Outbox::publish('email.campaign', $tenantId, $payload, $idem, $availableAt);
+            return true;
+        }
+
+        return false;
     }
 
     // ── Scheduling cohorte (mode per_session) via trigger 'event_session' ───────
@@ -396,15 +404,7 @@ final class EventSetup
     {
         $productId = (int)($event['product_id'] ?? 0);
 
-        // Dédup : retirer les messages cohorte en attente pour cet event
-        nfg_pdo_ops()
-            ->prepare("
-                DELETE FROM outbox_messages
-                WHERE tenant_id = ? AND type IN ('wa.event_message','email.campaign')
-                  AND JSON_EXTRACT(payload_json, '$.event_id') = ?
-                  AND status = 'pending'
-            ")
-            ->execute([$tenantId, $eventId]);
+        self::clearPendingMessages($tenantId, $eventId);
 
         $automations = self::findAutomationsByTrigger($tenantId, $productId, 'event_session');
         if (!$automations) {
@@ -429,14 +429,13 @@ final class EventSetup
         $count = 0;
         foreach ($automations as $auto) {
             $graph = json_decode($auto['graph'] ?? '{}', true) ?: [];
-            $steps = self::walkGraph($graph);
+            $steps = AutomationSchedule::walkGraph($graph);
             if (!$steps) continue;
 
             $num = 0;
             foreach ($sessions as $sess) {
                 $num++;
                 $refUtc = (string)($sess['start_at_utc'] ?? '');
-                $refTs  = strtotime($refUtc) ?: time();
                 $vars = [
                     'session.titre'  => (string)($sess['title'] ?? ''),
                     'session.title'  => (string)($sess['title'] ?? ''),
@@ -448,62 +447,13 @@ final class EventSetup
                 ];
 
                 foreach ($steps as $step) {
-                    if (($step['type'] ?? '') !== 'send') continue;
-
-                    $timing = $step['timing'] ?? ['mode' => 'relative', 'offset_seconds' => $step['offset_seconds'] ?? 0];
-                    if (($timing['mode'] ?? '') === 'fixed') {
-                        $availTs = self::fixedTimeTs($eventTz, $refUtc, (int)($timing['days'] ?? 0), (string)($timing['time'] ?? '09:00'));
-                    } else {
-                        $availTs = $refTs + (int)($timing['offset_seconds'] ?? 0);
-                    }
-                    $availableAt = date('Y-m-d H:i:s', $availTs);
                     $idem = substr(md5("evps{$eventId}_a{$auto['id']}_s{$sess['id']}_{$step['node_id']}"), 0, 32);
-
-                    if (($step['channel'] ?? '') === 'whatsapp') {
-                        if ($waGroupId === '') continue;
-                        $body = (($step['message_mode'] ?? '') === 'direct' && trim((string)($step['body'] ?? '')) !== '')
-                            ? (string)$step['body']
-                            : self::templateBody($tenantId, (int)$step['template_id'], 'whatsapp');
-                        $body = self::renderVars((string)$body, $vars);
-                        if (trim($body) === '') continue;
-                        Outbox::publish('wa.event_message', $tenantId, [
-                            'event_id' => $eventId, 'group_id' => $waGroupId, 'body' => $body,
-                        ], $idem, null);
-                        nfg_pdo_ops()
-                            ->prepare("UPDATE outbox_messages SET available_at = ? WHERE idem_key = ? AND type = 'wa.event_message' AND status = 'pending'")
-                            ->execute([$availableAt, $idem]);
-                        $count++;
-                    } elseif (($step['channel'] ?? '') === 'email') {
-                        $emailPayload = ['event_id' => $eventId];
-                        if (($step['message_mode'] ?? '') === 'direct'
-                            && ((string)($step['subject'] ?? '') !== '' || (string)($step['body'] ?? '') !== '')) {
-                            $emailPayload['message_mode'] = 'direct';
-                            $emailPayload['subject']      = self::renderVars((string)($step['subject'] ?? ''), $vars);
-                            $emailPayload['body']         = self::renderVars((string)($step['body'] ?? ''), $vars);
-                            if ((string)($step['from_email'] ?? '') !== '') $emailPayload['from_email'] = (string)$step['from_email'];
-                            if ((string)($step['from_name'] ?? '') !== '')  $emailPayload['from_name']  = (string)$step['from_name'];
-                        } else {
-                            if ((int)($step['template_id'] ?? 0) <= 0) continue;
-                            $emailPayload['template_id'] = (int)$step['template_id'];
-                        }
-                        Outbox::publish('email.campaign', $tenantId, $emailPayload, $idem, null);
-                        nfg_pdo_ops()
-                            ->prepare("UPDATE outbox_messages SET available_at = ? WHERE idem_key = ? AND type = 'email.campaign' AND status = 'pending'")
-                            ->execute([$availableAt, $idem]);
-                        $count++;
-                    }
+                    $at   = AutomationSchedule::sendAt($step['timing'], $refUtc, $eventTz);
+                    if (self::enqueueSend($tenantId, $eventId, $step, $waGroupId, $at, $idem, $vars)) $count++;
                 }
             }
         }
         self::writeState($tenantId, $eventId, ['scheduling' => ['status' => 'ready', 'count' => $count]]);
-    }
-
-    private static function renderVars(string $s, array $vars): string
-    {
-        if ($s === '' || strpos($s, '{{') === false) return $s;
-        $repl = [];
-        foreach ($vars as $k => $v) { $repl['{{' . $k . '}}'] = $v; $repl['{{ ' . $k . ' }}'] = $v; }
-        return strtr($s, $repl);
     }
 
     private static function frDate(string $ymd): string
@@ -591,11 +541,6 @@ final class EventSetup
         }
     }
 
-    private static function findEventCreatedAutomations(int $tenantId, int $productId): array
-    {
-        return self::findAutomationsByTrigger($tenantId, $productId, 'event_created');
-    }
-
     /** Automations actives dont le trigger == $kind (filtrées par produit). */
     private static function findAutomationsByTrigger(int $tenantId, int $productId, string $kind): array
     {
@@ -612,7 +557,7 @@ final class EventSetup
         $result = [];
         foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $row) {
             $graph   = json_decode($row['graph'] ?? '{}', true) ?: [];
-            $trigger = self::findTrigger($graph);
+            $trigger = AutomationSchedule::findTrigger($graph);
             if (!$trigger) continue;
             if (($trigger['kind'] ?? '') !== $kind) continue;
 
@@ -633,113 +578,5 @@ final class EventSetup
         ");
         $st->execute([$tenantId, $templateId, $kind]);
         return (string)($st->fetchColumn() ?: '');
-    }
-
-    // ── Graph walker ──────────────────────────────────────────────────────────
-
-    private static function findTrigger(array $graph): ?array
-    {
-        foreach ($graph['nodes'] ?? [] as $node) {
-            if (($node['data']['type'] ?? '') === 'trigger') return $node['data'];
-        }
-        return null;
-    }
-
-    /**
-     * Parcourt le graph linéairement depuis le trigger.
-     * Retourne les nœuds 'send' avec leur offset_seconds cumulé.
-     */
-    private static function walkGraph(array $graph): array
-    {
-        $nodes = [];
-        foreach ($graph['nodes'] ?? [] as $n) $nodes[$n['id']] = $n;
-
-        $edges = [];
-        foreach ($graph['edges'] ?? [] as $e) $edges[$e['source']][] = $e['target'];
-
-        $startId = null;
-        foreach ($nodes as $id => $n) {
-            if (($n['data']['type'] ?? '') === 'trigger') { $startId = $id; break; }
-        }
-        if (!$startId) return [];
-
-        $steps        = [];
-        $currentId    = $startId;
-        $offsetSec    = 0;     // cumul des délais "normaux" (relatif au début de l'événement)
-        $pendingEvent = null;  // dernier délai relatif/fixe à l'événement (absolu) avant un envoi
-        $visited      = [];
-
-        while ($currentId && !isset($visited[$currentId])) {
-            $visited[$currentId] = true;
-            $node = $nodes[$currentId] ?? null;
-            if (!$node) break;
-            $data = $node['data'] ?? [];
-
-            if (($data['type'] ?? '') === 'wait') {
-                $wm = (string)($data['wait_mode'] ?? '');
-                if ($wm === 'event_relative') {
-                    $d = (int)($data['event_days'] ?? 0);
-                    $h = (int)($data['event_hours'] ?? 0);
-                    $m = (int)($data['event_minutes'] ?? 0);
-                    $pendingEvent = ['mode' => 'relative', 'offset_seconds' => $d * 86400 + $h * 3600 + $m * 60];
-                } elseif ($wm === 'event_fixed') {
-                    $pendingEvent = [
-                        'mode' => 'fixed',
-                        'days' => (int)($data['event_days'] ?? 0),
-                        'time' => (string)($data['event_fixed_time'] ?? '09:00'),
-                    ];
-                } else {
-                    $unit  = $data['unit'] ?? 'days';
-                    $value = (float)($data['value'] ?? $data['minutes'] ?? 0);
-                    $offsetSec += (int)($value * match($unit) {
-                        'minutes' => 60,
-                        'hours'   => 3600,
-                        default   => 86400,
-                    });
-                }
-            } elseif (($data['type'] ?? '') === 'send') {
-                $timing = $pendingEvent ?? ['mode' => 'relative', 'offset_seconds' => $offsetSec];
-                $pendingEvent = null;
-
-                $mode = (string)($data['message_mode'] ?? '');
-                if ($mode !== 'direct' && $mode !== 'template') {
-                    $mode = ((string)($data['template_id'] ?? '') !== '') ? 'template' : 'direct';
-                }
-
-                $steps[] = [
-                    'type'           => 'send',
-                    'node_id'        => $currentId,
-                    'channel'        => $data['channel'] ?? '',
-                    'template_id'    => $data['template_id'] ?? '',
-                    'message_mode'   => $mode,
-                    'subject'        => (string)($data['subject'] ?? ''),
-                    'body'           => (string)($data['body'] ?? ''),
-                    'from_email'     => (string)($data['from_email'] ?? ''),
-                    'from_name'      => (string)($data['from_name'] ?? ''),
-                    'message'        => (string)($data['message'] ?? ''),
-                    'timing'         => $timing,
-                    'offset_seconds' => $timing['mode'] === 'relative' ? (int)$timing['offset_seconds'] : 0,
-                ];
-            }
-
-            $currentId = $edges[$currentId][0] ?? null;
-        }
-        return $steps;
-    }
-
-    /** Instant UTC (epoch) pour (date locale de l'événement ± $days) à $time (HH:MM) dans le fuseau de l'événement. */
-    private static function fixedTimeTs(string $tz, string $refUtc, int $days, string $time): int
-    {
-        try {
-            $dt = new \DateTime($refUtc, new \DateTimeZone('UTC'));
-            $dt->setTimezone(new \DateTimeZone($tz ?: 'UTC'));
-            if ($days !== 0) $dt->modify(($days > 0 ? '+' : '-') . abs($days) . ' days');
-            $parts = array_pad(explode(':', $time), 2, '0');
-            $dt->setTime((int)$parts[0], (int)$parts[1], 0);
-            $dt->setTimezone(new \DateTimeZone('UTC'));
-            return $dt->getTimestamp();
-        } catch (\Throwable $e) {
-            return (int)(strtotime($refUtc) ?: time());
-        }
     }
 }

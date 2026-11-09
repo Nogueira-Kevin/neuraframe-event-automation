@@ -1,5 +1,5 @@
 <?php
-// global-db/_inc/Sandbox.php
+// Sandbox.php
 // Tenants « bac à sable » (compte de démonstration) : aucun e-mail ni message WhatsApp ne sort.
 // Liste dans .env : NFG_SANDBOX_TENANTS="50" (plusieurs : "50,51").
 // Les senders font comme si l envoi avait réussi et le notent dans le journal PHP : les écrans

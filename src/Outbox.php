@@ -1,5 +1,7 @@
 <?php
-// public_html/global-db/_inc/Outbox.php
+// Outbox.php
+// File de messages asynchrone (table outbox_messages) : publication idempotente,
+// réservation par lots, reprise avec backoff exponentiel, puis file des échecs.
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/db.php';
@@ -7,7 +9,7 @@ require_once __DIR__ . '/../config/db.php';
 final class Outbox
 {
   /**
-   * Publica uma mensagem na fila (idempotente por idem_key).
+   * Publie un message dans la file (idempotent grâce à idem_key).
    * @param string|null $availableAt  MySQL DATETIME — si fourni, le message ne sera
    *                                  traité qu'à partir de cette date (scheduling natif).
    *                                  null = traitement immédiat.
@@ -47,15 +49,15 @@ final class Outbox
   }
 
   /**
-   * Reivindica um lote (status: pending -> processing),
-   * bloqueando com FOR UPDATE para evitar corridas.
+   * Réserve un lot (pending → processing). FOR UPDATE empêche deux workers
+   * lancés en même temps de prendre les mêmes messages.
    */
   public static function claimBatch(string $type, int $limit = 50): array
   {
     $pdo = nfg_pdo_ops();
     $pdo->beginTransaction();
     try {
-      // somente mensagens liberadas (available_at <= agora ou null)
+      // seulement les messages arrivés à échéance (available_at passé ou null)
       $stmt = $pdo->prepare("
         SELECT id
         FROM outbox_messages
@@ -70,7 +72,6 @@ final class Outbox
       if (!$ids) { $pdo->commit(); return []; }
 
       $in  = implode(',', array_fill(0, count($ids), '?'));
-      // processing_at removido → não existe na tabela
       $upd = $pdo->prepare("
         UPDATE outbox_messages
         SET status='processing', updated_at=NOW()
@@ -107,7 +108,6 @@ final class Outbox
   public static function markDone(int $id): void
   {
     $pdo = nfg_pdo_ops();
-    // done_at removido → não existe na tabela
     $pdo->prepare("
       UPDATE outbox_messages
       SET status='done', updated_at=NOW()
@@ -116,14 +116,13 @@ final class Outbox
   }
 
   /**
-   * Registra erro e aplica backoff exponencial (1m, 2m, 4m, 8m, 16m...).
-   * Quando tenta >= $maxAttempts -> DLQ.
+   * Enregistre l'erreur et replanifie avec un backoff exponentiel (1, 2, 4, 8, 16 min).
+   * Au-delà de $maxAttempts tentatives, le message part en file des échecs (DLQ).
    */
   public static function markError(int $id, string $err, int $maxAttempts = 6): void
   {
     $pdo = nfg_pdo_ops();
 
-    // lê estado atual
     $st = $pdo->prepare("
       SELECT attempts, tenant_id, type, payload_json
       FROM outbox_messages
@@ -186,7 +185,8 @@ final class Outbox
       $pdo->commit();
     } catch (\Throwable $e) {
       $pdo->rollBack();
-      // mantém como está; o worker vai tentar de novo
+      // échec du transfert en DLQ : le message reste tel quel, visible dans les journaux
+      error_log("[Outbox] moveToDeadLetter #{$id} : " . $e->getMessage());
     }
   }
 }

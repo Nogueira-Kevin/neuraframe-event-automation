@@ -1,16 +1,15 @@
 <?php
-// global-db/_inc/senders/WppSender.php
+// WppSender.php — envoi WhatsApp via Evolution API
 declare(strict_types=1);
 
-require_once __DIR__ . '/../EvoApi.php';
-require_once __DIR__ . '/../Sandbox.php';   // formes de payload v1 / v2
+require_once __DIR__ . '/../EvoApi.php';   // formes de payload v1 / v2
+require_once __DIR__ . '/../Sandbox.php';
 
 final class WppSender
 {
     // ── API publique ──────────────────────────────────────────────────────────
 
-    /** Message direct (DM ou groupe si chatId se termine par @g.us). */
-    /** Message direct. Renvoie la réponse Evolution (contient key.id → journal du fil). */
+    /** Message direct (ou groupe si chatId finit par @g.us). Renvoie la réponse Evolution (key.id → journal du fil). */
     public static function sendText(int $tenantId, string $chatId, string $text): array
     {
         return self::postFB($tenantId, $chatId, $text);
@@ -105,7 +104,7 @@ final class WppSender
 
     /** Envoi texte avec fallback plateforme : on tente l'instance du tenant ;
      *  si elle est absente/déconnectée/sans token, on bascule sur le WhatsApp
-     *  du tenant 1 (demande Kevin : tout tenant sans WPP connecté émet via t1). */
+     *  du tenant 1 : un tenant sans WhatsApp connecté émet via le numéro de la plateforme. */
     private static function postFB(int $tenantId, string $chatId, string $text): array
     {
         // Avant le repli sur le tenant 1 : sinon le bac à sable écrirait depuis le vrai numéro.
