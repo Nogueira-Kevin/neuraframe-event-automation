@@ -34,7 +34,9 @@ final class EventSetup
         }
 
         try {
-            self::writeState($tenantId, $eventId, ['phase' => 'running']);
+            // L'état est fusionné, jamais remplacé : sans remise à zéro, l'erreur d'un passage
+            // précédent restait affichée à côté de phase « done ».
+            self::writeState($tenantId, $eventId, ['phase' => 'running', 'error' => null]);
 
             // 1. Charger event
             $event = self::loadEvent($tenantId, $eventId);
@@ -74,11 +76,21 @@ final class EventSetup
             self::writeState($tenantId, $eventId, ['whatsapp' => ['status' => 'ready', 'group_id' => (string)$waGroupId, 'invite_link' => $inv]]);
 
             // 4. Liste Brevo
-            $brevoListId = $event['brevo_list_id'] ?? null;
+            // Non bloquante : la liste Brevo ne sert pas à la planification (les e-mails partent
+            // vers les inscrits de l'événement). Une clé Brevo désactivée arrêtait toute la suite,
+            // y compris les rappels WhatsApp.
+            $brevoListId = (int)($event['brevo_list_id'] ?? 0);
             if (!$brevoListId) {
-                $brevoListId = self::setupBrevoList($tenantId, $eventId, $event, $product);
+                try {
+                    $brevoListId = self::setupBrevoList($tenantId, $eventId, $event, $product);
+                } catch (\Throwable $e) {
+                    error_log("EventSetup::setupBrevoList failed event={$eventId}: " . $e->getMessage());
+                    self::writeState($tenantId, $eventId, ['brevo' => ['status' => 'error', 'error' => mb_substr($e->getMessage(), 0, 200)]]);
+                }
             }
-            self::writeState($tenantId, $eventId, ['brevo' => ['status' => 'ready', 'list_id' => (int)$brevoListId]]);
+            if ($brevoListId) {
+                self::writeState($tenantId, $eventId, ['brevo' => ['status' => 'ready', 'list_id' => $brevoListId]]);
+            }
 
             // 5. Planifier les messages (écrit scheduling.* en interne)
             if ((string)($event['content_mode'] ?? 'repetitive') === 'per_session') {
